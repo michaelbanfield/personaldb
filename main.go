@@ -3,16 +3,18 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
-	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 // addr is the bind address for the web server.
@@ -43,43 +45,116 @@ func run() error {
 		return err
 	}
 	defer db.Close()
+	isRO := func(query string) (bool, error) {
+		c, err := db.Conn(context.Background())
+		defer c.Close()
+		if err != nil {
+			return false, err
+		}
 
-	// Create table for storing page views.
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS page_views (id INTEGER PRIMARY KEY, timestamp TEXT);`); err != nil {
-		return fmt.Errorf("cannot create table: %w", err)
+		var ro bool
+		err = c.Raw(func(dc interface{}) error {
+			stmt, err := dc.(*sqlite3.SQLiteConn).Prepare(query)
+			if err != nil {
+				return err
+			}
+			if stmt == nil {
+				return errors.New("stmt is nil")
+			}
+			ro = stmt.(*sqlite3.SQLiteStmt).Readonly()
+			return nil
+		})
+		if err != nil {
+			return false, err
+		}
+		return ro, nil // On errors ro will remain false.
 	}
 
 	// Run web server.
 	fmt.Printf("listening on %s\n", addr)
 	go http.ListenAndServe(addr,
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/favicon.ico" {
-				w.WriteHeader(404)
-				fmt.Fprintf(w, "Not found")
+			if r.URL.Path != "/query" {
+				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
 
-			// Store page view.
-			if _, err := db.Exec(`INSERT INTO page_views (timestamp) VALUES (?);`, time.Now().Format(time.RFC3339)); err != nil {
+			runInput := func() error {
+				body, err := ioutil.ReadAll(r.Body)
+				if err != nil {
+					return err
+				}
+				queries := strings.Split(string(body), ";")
+
+				for _, query := range queries {
+
+					ro, err := isRO(query)
+					if err != nil {
+						return err
+					}
+					if ro {
+						rows, err := db.Query(query)
+						defer rows.Close()
+						if err != nil {
+							return err
+						}
+						cols, err := rows.Columns()
+						if err != nil {
+							return err
+						}
+						numCols := len(cols)
+						if numCols == 0 {
+							continue
+						}
+
+						fmt.Fprintf(w, "%s\n", cols)
+
+						// Result is your slice string.
+						rawResult := make([][]byte, numCols)
+						result := make([]string, numCols)
+
+						dest := make([]interface{}, len(cols)) // A temporary interface{} slice
+						for i := range rawResult {
+							dest[i] = &rawResult[i] // Put pointers to each string in the interface slice
+						}
+						for rows.Next() {
+							// Scan the row into the slice of sql.RawBytes pointers
+							err = rows.Scan(dest...)
+							if err != nil {
+								return err
+							}
+
+							for i, raw := range rawResult {
+								if raw == nil {
+									result[i] = "\\N"
+								} else {
+									result[i] = string(raw)
+								}
+							}
+							fmt.Fprintf(w, "%s\n", result)
+						}
+
+					} else {
+						result, err := db.Exec(query)
+						if err != nil {
+							return err
+						}
+						fmt.Fprintf(w, "%s\n", result)
+					}
+				}
+				return nil
+			}
+
+			err := runInput()
+			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
 			}
-
-			// Read total page views.
-			var n int
-			if err := db.QueryRow(`SELECT COUNT(1) FROM page_views;`).Scan(&n); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			// Print total page views.
-			fmt.Fprintf(w, "This server has been visited %d times.\n", n)
 		}),
 	)
 
 	// Wait for signal.
 	<-ctx.Done()
-	log.Print("myapp received signal, shutting down")
+	log.Print("personaldb received signal, shutting down")
 
 	return nil
 }
